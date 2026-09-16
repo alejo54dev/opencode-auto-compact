@@ -20,7 +20,7 @@
 *	}
 *
 *	@name auto-compact
-*	@version 0.1.0
+*	@version 0.1.1
 *	@author Alejandro Carraretto
 *	@assistant DeepSeek-Flash
 *	@license AGPL-3.0
@@ -271,7 +271,7 @@ class AutoCompact
 	}
 
 	// Force native compaction (summarize) on demand, with the resolved model
-	protected async compact( sessionID : string, state : SessionState ) : Promise<void>
+	protected async compact( sessionID : string, state : SessionState, percent : number ) : Promise<void>
 	{
 		const usage = state.usage ;
 		if ( ! usage ) return ;
@@ -280,6 +280,28 @@ class AutoCompact
 		state.lastCompactAt = Date.now() ;
 
 		const model = await this.resolveModel( usage ) ;
+
+		try
+		{
+			// ignored: UI-only notice, NOT sent to model
+			await this.client.session.prompt( {
+				path : { id : sessionID } ,
+				body : {
+					noReply : true ,
+					parts : [
+						{
+							type : "text" ,
+							text : `▣ auto-compact: ${ percent.toFixed( 1 ) }% ≥ ${ this.config.target_percent }% — compacting with ${ model.providerID }/${ model.modelID }` ,
+							ignored : true ,
+						} ,
+					] ,
+				} ,
+			} ) ;
+		}
+		catch ( err )
+		{
+			log( LOG_LEVEL.ERROR, `notice failed: ${ ( err as Error ).message }` ) ;
+		}
 
 		try
 		{
@@ -330,7 +352,7 @@ class AutoCompact
 		log( LOG_LEVEL.INFO,
 			`Threshold reached | session: ${ sessionID } | ${ percent.toFixed( 1 ) }% >= ${ this.config.target_percent }%` ) ;
 
-		await this.compact( sessionID, state ) ;
+		await this.compact( sessionID, state, percent ) ;
 	}
 
 	// Cache usage from assistant messages; log the summarizer model on summary messages
