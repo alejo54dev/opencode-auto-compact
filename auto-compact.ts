@@ -1,0 +1,430 @@
+/**
+*	auto-compact.ts
+*
+*	OpenCode plugin — fixed-percentage compaction trigger with model delegation.
+*	Fires native compaction at target_percent of the context window and lets
+*	opencode summarize with small_model (or an explicit provider/model), never
+*	with the working model.
+*
+*	Install: cp auto-compact.ts ~/.config/opencode/plugins/auto-compact.ts
+*	Config:  ~/.config/opencode/auto-compact.jsonc
+*	Log:     ~/.config/opencode/auto-compact.log
+*
+*	@example ~/.config/opencode/auto-compact.jsonc
+*	{
+*		"enabled": true,                // master switch
+*		"target_percent": 70,           // compact when context usage reaches this %
+*		"cooldown_seconds": 60,         // min seconds between compactions per session
+*		"compact_model": "small_model", // "small_model" | "provider/model" | ""
+*		"log_level": "info"             // "silent" | "error" | "info" | "debug"
+*	}
+*
+*	@name auto-compact
+*	@version 0.1.0
+*	@author Alejandro Carraretto
+*	@assistant DeepSeek-Flash
+*	@license AGPL-3.0
+*/
+
+import type { Plugin, PluginInput } from "@opencode-ai/plugin" ;
+import { appendFileSync, readFileSync } from "node:fs" ;
+import { homedir } from "node:os" ;
+import { join } from "node:path" ;
+
+// ─── Paths ─────────────────────────────────────────────────────────────────
+
+const CONFIG_DIR  = join( homedir(), ".config", "opencode" ) ;
+const CONFIG_FILE = join( CONFIG_DIR, "auto-compact.jsonc" ) ;
+const LOG_FILE    = join( CONFIG_DIR, "auto-compact.log" ) ;
+
+// ─── Constants ─────────────────────────────────────────────────────────────
+
+const LOG_LEVEL =
+{
+	SILENT : 0,
+	ERROR  : 1,
+	INFO   : 2,
+	DEBUG  : 3,
+} as const ;
+
+const CONFIG : Config =
+{
+	enabled: true,
+	target_percent: 70,
+	cooldown_seconds: 60,
+	compact_model: "small_model",
+	log_level: "info",
+};
+
+// ─── Interfaces ────────────────────────────────────────────────────────────
+
+interface Config
+{
+	enabled          : boolean ;
+	target_percent   : number ;
+	cooldown_seconds : number ;
+	compact_model    : string ;
+	log_level        : "silent" | "error" | "info" | "debug" ;
+}
+
+interface ModelRef
+{
+	providerID : string ;
+	modelID    : string ;
+}
+
+interface Usage extends ModelRef
+{
+	tokens : number ;
+}
+
+interface SessionState
+{
+	usage?        : Usage ;
+	inProgress    : boolean ;
+	lastCompactAt : number ;
+}
+
+interface MessageInfo
+{
+	role?       : string ;
+	sessionID?  : string ;
+	summary?    : boolean ;
+	providerID? : string ;
+	modelID?    : string ;
+	tokens?     :
+	{
+		input?     : number ;
+		output?    : number ;
+		reasoning? : number ;
+		cache?     : { read? : number; write? : number } ;
+	} ;
+}
+
+interface ProviderEntry
+{
+	id     : string ;
+	models : Record<string, { limit? : { context? : number } }> ;
+}
+
+// ─── Global Helpers ──────────────────────────────────────────────────────────
+
+// Current local datetime as ISO-like string: "2026-07-06T20:30:26"
+function timestamp() : string
+{
+	const utc    = new Date() ;
+	const offset = utc.getTimezoneOffset() ;
+	const local  = new Date( utc.getTime() - offset * 60 * 1000 ) ;
+
+	return local.toISOString().slice( 0, 19 ) ;
+}
+
+// Load config from ~/.config/opencode/auto-compact.jsonc, fall back to defaults
+function loadConfig() : Config
+{
+	let file : Record<string, unknown> = {} ;
+	try
+	{
+		file = Bun.JSONC.parse( readFileSync( CONFIG_FILE, "utf-8" ) ) ;
+	}
+	catch
+	{
+		log( LOG_LEVEL.ERROR, `Config not found or parse error at ${ CONFIG_FILE }` ) ;
+	}
+
+	// Validate between file values and defaults values.
+	CONFIG.enabled          = file.enabled          ?? CONFIG.enabled ;
+	CONFIG.target_percent   = file.target_percent   ?? CONFIG.target_percent ;
+	CONFIG.cooldown_seconds = file.cooldown_seconds ?? CONFIG.cooldown_seconds ;
+	CONFIG.compact_model    = file.compact_model    ?? CONFIG.compact_model ;
+	CONFIG.log_level        = file.log_level        ?? CONFIG.log_level ;
+
+	log( LOG_LEVEL.INFO, "Config loaded" ) ;
+
+	return CONFIG ;
+}
+
+// Append timestamped entry to ~/.config/opencode/auto-compact.log
+function log( level : number, message : string ) : void
+{
+	const min = LOG_LEVEL[ ( CONFIG.log_level ?? "info" ).toUpperCase() ] ?? LOG_LEVEL.ERROR ;
+
+	if ( level > min ) return ;
+
+	const label = Object.keys( LOG_LEVEL )[ level ] ?? "" ;
+
+	try
+	{
+		appendFileSync( LOG_FILE, `[${ timestamp() }] [${ label }]: ${ message }\n` ) ;
+	}
+	catch {}
+}
+
+// ─── AutoCompact ───────────────────────────────────────────────────────────
+
+// Controller class: holds all plugin state and logic.
+class AutoCompact
+{
+	private config : Config ;
+	private client : PluginInput[ "client" ] ;
+	private sessions : Map<string, SessionState> = new Map() ;
+	private providers : ProviderEntry[] | null = null ;
+	private smallModel : ModelRef | null | undefined = undefined ;
+
+	// Initialize: store config + client, no side effects
+	constructor( config : Config, client : PluginInput[ "client" ] )
+	{
+		this.config = config ;
+		this.client = client ;
+	}
+
+	// ── Internal helpers ───────────────────────────────────────────────
+
+	// Provider catalog, fetched once and cached (null on failure, retried next call)
+	protected async providerList() : Promise<ProviderEntry[] | null>
+	{
+		if ( this.providers ) return this.providers ;
+
+		try
+		{
+			const res = await this.client.provider.list() ;
+			this.providers = ( res?.data?.all ?? [] ) as ProviderEntry[] ;
+		}
+		catch ( err )
+		{
+			log( LOG_LEVEL.ERROR, `provider.list failed: ${ ( err as Error ).message }` ) ;
+			return null ;
+		}
+
+		return this.providers ;
+	}
+
+	// Known model entry from the catalog; null when the model is unknown
+	protected async findModel( ref : ModelRef ) : Promise<{ context : number } | null>
+	{
+		const providers = await this.providerList() ;
+		const provider  = providers?.find( p => p.id === ref.providerID ) ;
+		const model     = provider?.models?.[ ref.modelID ] ;
+
+		if ( ! model ) return null ;
+
+		return { context : model.limit?.context ?? 0 } ;
+	}
+
+	// Parse "provider/model" on the first slash
+	protected parseModel( value : string ) : ModelRef | null
+	{
+		const index = value.indexOf( "/" ) ;
+		if ( index <= 0 || index >= value.length - 1 ) return null ;
+
+		return { providerID : value.slice( 0, index ), modelID : value.slice( index + 1 ) } ;
+	}
+
+	// Sum every token counter reported by the provider for one assistant message
+	protected totalTokens( info : MessageInfo ) : number
+	{
+		const t = info.tokens ;
+		if ( ! t ) return 0 ;
+
+		return ( t.input ?? 0 ) + ( t.output ?? 0 ) + ( t.reasoning ?? 0 )
+			+ ( t.cache?.read ?? 0 ) + ( t.cache?.write ?? 0 ) ;
+	}
+
+	// Pick the summarizer model: compact_model -> opencode small_model -> session model
+	protected async resolveModel( session : ModelRef ) : Promise<ModelRef>
+	{
+		const sessionRef = { providerID : session.providerID, modelID : session.modelID } ;
+		const configured = this.config.compact_model.trim() ;
+
+		if ( configured === "" ) return sessionRef ;
+
+		if ( configured !== "small_model" )
+		{
+			const parsed = this.parseModel( configured ) ;
+
+			if ( parsed && await this.findModel( parsed ) ) return parsed ;
+
+			log( LOG_LEVEL.ERROR, `compact_model unusable: ${ configured }` ) ;
+
+			return sessionRef ;
+		}
+
+		if ( this.smallModel === undefined )
+		{
+			this.smallModel = null ;
+
+			try
+			{
+				const res     = await this.client.config.get() ;
+				const value   = res?.data?.small_model ?? "" ;
+				const parsed  = value ? this.parseModel( value ) : null ;
+
+				if ( parsed && await this.findModel( parsed ) ) this.smallModel = parsed ;
+			}
+			catch ( err )
+			{
+				log( LOG_LEVEL.ERROR, `config.get failed: ${ ( err as Error ).message }` ) ;
+			}
+		}
+
+		return this.smallModel ?? sessionRef ;
+	}
+
+	// Force native compaction (summarize) on demand, with the resolved model
+	protected async compact( sessionID : string, state : SessionState ) : Promise<void>
+	{
+		const usage = state.usage ;
+		if ( ! usage ) return ;
+
+		state.inProgress    = true ;
+		state.lastCompactAt = Date.now() ;
+
+		const model = await this.resolveModel( usage ) ;
+
+		try
+		{
+			const res = await this.client.session.summarize( {
+				path : { id : sessionID } ,
+				body : { providerID : model.providerID, modelID : model.modelID } ,
+			} ) ;
+
+			if ( res?.error )
+			{
+				log( LOG_LEVEL.ERROR, `summarize rejected: ${ JSON.stringify( res.error ) }` ) ;
+				state.inProgress = false ;
+				return ;
+			}
+
+			log( LOG_LEVEL.INFO,
+				`Compaction triggered | session: ${ sessionID } | model: ${ model.providerID }/${ model.modelID } | tokens: ${ usage.tokens }` ) ;
+		}
+		catch ( err )
+		{
+			log( LOG_LEVEL.ERROR, `summarize failed: ${ ( err as Error ).message }` ) ;
+			state.inProgress = false ;
+		}
+	}
+
+	// Evaluate the threshold on an idle session and compact when reached
+	protected async evaluate( sessionID : string ) : Promise<void>
+	{
+		const state = this.sessions.get( sessionID ) ;
+		if ( ! state?.usage ) return ;
+
+		if ( state.inProgress )
+		{
+			// Stale guard: a missing "session.compacted" event must not lock the session
+			if ( Date.now() - state.lastCompactAt < this.config.cooldown_seconds * 2000 ) return ;
+
+			state.inProgress = false ;
+		}
+
+		if ( Date.now() - state.lastCompactAt < this.config.cooldown_seconds * 1000 ) return ;
+
+		const model = await this.findModel( state.usage ) ;
+		if ( ! model?.context ) return ;
+
+		const percent = ( state.usage.tokens / model.context ) * 100 ;
+		if ( percent < this.config.target_percent ) return ;
+
+		log( LOG_LEVEL.INFO,
+			`Threshold reached | session: ${ sessionID } | ${ percent.toFixed( 1 ) }% >= ${ this.config.target_percent }%` ) ;
+
+		await this.compact( sessionID, state ) ;
+	}
+
+	// Cache usage from assistant messages; log the summarizer model on summary messages
+	protected onMessage( info : MessageInfo | undefined ) : void
+	{
+		if ( ! info || info.role !== "assistant" ) return ;
+
+		if ( info.summary )
+		{
+			log( LOG_LEVEL.INFO, `Summary generated | model: ${ info.providerID }/${ info.modelID }` ) ;
+			return ;
+		}
+
+		if ( ! info.tokens || ! info.sessionID ) return ;
+
+		const state = this.sessions.get( info.sessionID ) ?? { inProgress : false, lastCompactAt : 0 } ;
+
+		state.usage = {
+			tokens     : this.totalTokens( info ) ,
+			providerID : info.providerID ?? "" ,
+			modelID    : info.modelID ?? "" ,
+		} ;
+
+		this.sessions.set( info.sessionID, state ) ;
+	}
+
+	// ── Public hooks ──────────────────────────────────────────────────────
+
+	// Route plugin events: usage tracking, idle evaluation, compaction completion
+	public async handleEvent( event : { type : string; properties? : Record<string, any> } ) : Promise<void>
+	{
+		try
+		{
+			if ( event.type === "message.updated" )
+			{
+				this.onMessage( event.properties?.info ) ;
+				return ;
+			}
+
+			if ( event.type === "session.idle" )
+			{
+				await this.evaluate( event.properties?.sessionID ) ;
+				return ;
+			}
+
+			if ( event.type === "session.compacted" )
+			{
+				const state = this.sessions.get( event.properties?.sessionID ) ;
+				if ( state ) state.inProgress = false ;
+			}
+		}
+		catch ( err )
+		{
+			log( LOG_LEVEL.ERROR, `event ${ event.type }: ${ ( err as Error ).message }` ) ;
+		}
+	}
+
+	// Cleanup: clear all state
+	public dispose() : void
+	{
+		this.sessions.clear() ;
+		log( LOG_LEVEL.INFO, "Disposed" ) ;
+	}
+}
+
+// ─── Plugin ────────────────────────────────────────────────────────────────
+
+// Plugin factory: load config, build AutoCompact, register hooks
+export default ( async ( ctx : PluginInput ) =>
+{
+	const opts = loadConfig() ;
+
+	if ( ! opts.enabled )
+	{
+		log( LOG_LEVEL.INFO, "Disabled" ) ;
+		return {} ;
+	}
+
+	const ac = new AutoCompact( opts, ctx.client ) ;
+
+	log( LOG_LEVEL.INFO, "Initialized" ) ;
+
+	return {
+		event : async ( { event } ) =>
+		{
+			await ac.handleEvent( event as { type : string; properties? : Record<string, any> } ) ;
+		},
+
+		// Cleanup: clear all state
+		dispose : async () =>
+		{
+			ac.dispose() ;
+		},
+	} ;
+} ) satisfies Plugin ;
+
+// ─── END ──────────────────────────────────────────────────────────────
