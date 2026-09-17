@@ -13,14 +13,14 @@
 *	@example ~/.config/opencode/auto-compact.jsonc
 *	{
 *		"enabled": true,                // master switch
-*		"target_percent": 70,           // compact when context usage reaches this %
+*		"target_percent": 50,           // compact when context usage reaches this %
 *		"cooldown_seconds": 60,         // min seconds between compactions per session
 *		"compact_model": "small_model", // "small_model" | "provider/model" | ""
 *		"log_level": "info"             // "silent" | "error" | "info" | "debug"
 *	}
 *
 *	@name auto-compact
-*	@version 0.1.1
+*	@version 0.1.2
 *	@author Alejandro Carraretto
 *	@assistant DeepSeek-Flash
 *	@license AGPL-3.0
@@ -50,7 +50,7 @@ const LOG_LEVEL =
 const CONFIG : Config =
 {
 	enabled: true,
-	target_percent: 70,
+	target_percent: 50,
 	cooldown_seconds: 60,
 	compact_model: "small_model",
 	log_level: "info",
@@ -88,6 +88,7 @@ interface SessionState
 interface MessageInfo
 {
 	role?       : string ;
+	id?         : string ;
 	sessionID?  : string ;
 	summary?    : boolean ;
 	providerID? : string ;
@@ -168,6 +169,7 @@ class AutoCompact
 	private config : Config ;
 	private client : PluginInput[ "client" ] ;
 	private sessions : Map<string, SessionState> = new Map() ;
+	private loggedSummaries : Set<string> = new Set() ;
 	private providers : ProviderEntry[] | null = null ;
 	private smallModel : ModelRef | null | undefined = undefined ;
 
@@ -270,41 +272,45 @@ class AutoCompact
 		return this.smallModel ?? sessionRef ;
 	}
 
-	// Force native compaction (summarize) on demand, with the resolved model
+	// Force native compaction (summarize) on demand, with the resolved model.
+	// The caller must have claimed state.inProgress; it is always released here.
 	protected async compact( sessionID : string, state : SessionState, percent : number ) : Promise<void>
 	{
 		const usage = state.usage ;
-		if ( ! usage ) return ;
+		if ( ! usage )
+		{
+			state.inProgress = false ;
+			return ;
+		}
 
-		state.inProgress    = true ;
 		state.lastCompactAt = Date.now() ;
 
-		const model = await this.resolveModel( usage ) ;
-
 		try
 		{
-			// ignored: UI-only notice, NOT sent to model
-			await this.client.session.prompt( {
-				path : { id : sessionID } ,
-				body : {
-					noReply : true ,
-					parts : [
-						{
-							type : "text" ,
-							text : `▣ auto-compact: ${ percent.toFixed( 1 ) }% ≥ ${ this.config.target_percent }% — compacting with ${ model.providerID }/${ model.modelID }` ,
-							ignored : true ,
-						} ,
-					] ,
-				} ,
-			} ) ;
-		}
-		catch ( err )
-		{
-			log( LOG_LEVEL.ERROR, `notice failed: ${ ( err as Error ).message }` ) ;
-		}
+			const model = await this.resolveModel( usage ) ;
 
-		try
-		{
+			try
+			{
+				// ignored: UI-only notice, NOT sent to model
+				await this.client.session.prompt( {
+					path : { id : sessionID } ,
+					body : {
+						noReply : true ,
+						parts : [
+							{
+								type : "text" ,
+								text : `▣ auto-compact: ${ percent.toFixed( 1 ) }% ≥ ${ this.config.target_percent }% — compacting with ${ model.providerID }/${ model.modelID }` ,
+								ignored : true ,
+							} ,
+						] ,
+					} ,
+				} ) ;
+			}
+			catch ( err )
+			{
+				log( LOG_LEVEL.ERROR, `notice failed: ${ ( err as Error ).message }` ) ;
+			}
+
 			const res = await this.client.session.summarize( {
 				path : { id : sessionID } ,
 				body : { providerID : model.providerID, modelID : model.modelID } ,
@@ -313,7 +319,6 @@ class AutoCompact
 			if ( res?.error )
 			{
 				log( LOG_LEVEL.ERROR, `summarize rejected: ${ JSON.stringify( res.error ) }` ) ;
-				state.inProgress = false ;
 				return ;
 			}
 
@@ -322,24 +327,23 @@ class AutoCompact
 		}
 		catch ( err )
 		{
-			log( LOG_LEVEL.ERROR, `summarize failed: ${ ( err as Error ).message }` ) ;
+			log( LOG_LEVEL.ERROR, `compact failed: ${ ( err as Error ).message }` ) ;
+		}
+		finally
+		{
 			state.inProgress = false ;
 		}
 	}
 
-	// Evaluate the threshold on an idle session and compact when reached
+	// Evaluate the threshold on an idle session and compact when reached.
+	// One compaction in flight per session: the claim is synchronous, and
+	// compact() is its only releaser (finally) — no event may release it.
 	protected async evaluate( sessionID : string ) : Promise<void>
 	{
 		const state = this.sessions.get( sessionID ) ;
 		if ( ! state?.usage ) return ;
 
-		if ( state.inProgress )
-		{
-			// Stale guard: a missing "session.compacted" event must not lock the session
-			if ( Date.now() - state.lastCompactAt < this.config.cooldown_seconds * 2000 ) return ;
-
-			state.inProgress = false ;
-		}
+		if ( state.inProgress ) return ;
 
 		if ( Date.now() - state.lastCompactAt < this.config.cooldown_seconds * 1000 ) return ;
 
@@ -348,6 +352,11 @@ class AutoCompact
 
 		const percent = ( state.usage.tokens / model.context ) * 100 ;
 		if ( percent < this.config.target_percent ) return ;
+
+		// Re-check after the awaits: another idle event may have claimed the session
+		if ( state.inProgress ) return ;
+
+		state.inProgress = true ;
 
 		log( LOG_LEVEL.INFO,
 			`Threshold reached | session: ${ sessionID } | ${ percent.toFixed( 1 ) }% >= ${ this.config.target_percent }%` ) ;
@@ -362,7 +371,15 @@ class AutoCompact
 
 		if ( info.summary )
 		{
-			log( LOG_LEVEL.INFO, `Summary generated | model: ${ info.providerID }/${ info.modelID }` ) ;
+			const id = info.id ?? "" ;
+
+			if ( ! id || ! this.loggedSummaries.has( id ) )
+			{
+				if ( id ) this.loggedSummaries.add( id ) ;
+
+				log( LOG_LEVEL.INFO, `Summary generated | model: ${ info.providerID }/${ info.modelID }` ) ;
+			}
+
 			return ;
 		}
 
@@ -381,7 +398,7 @@ class AutoCompact
 
 	// ── Public hooks ──────────────────────────────────────────────────────
 
-	// Route plugin events: usage tracking, idle evaluation, compaction completion
+	// Route plugin events: usage tracking and idle evaluation
 	public async handleEvent( event : { type : string; properties? : Record<string, any> } ) : Promise<void>
 	{
 		try
@@ -395,13 +412,6 @@ class AutoCompact
 			if ( event.type === "session.idle" )
 			{
 				await this.evaluate( event.properties?.sessionID ) ;
-				return ;
-			}
-
-			if ( event.type === "session.compacted" )
-			{
-				const state = this.sessions.get( event.properties?.sessionID ) ;
-				if ( state ) state.inProgress = false ;
 			}
 		}
 		catch ( err )
@@ -414,6 +424,7 @@ class AutoCompact
 	public dispose() : void
 	{
 		this.sessions.clear() ;
+		this.loggedSummaries.clear() ;
 		log( LOG_LEVEL.INFO, "Disposed" ) ;
 	}
 }
