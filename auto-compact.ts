@@ -20,7 +20,7 @@
 *	}
 *
 *	@name auto-compact
-*	@version 0.1.3
+*	@version 0.1.5
 *	@author Alejandro Carraretto
 *	@assistant DeepSeek-Flash
 *	@license AGPL-3.0
@@ -49,10 +49,10 @@ const LOG_LEVEL =
 
 const CONFIG : Config =
 {
-	enabled: true,
-	target_percent: 50,
-	cooldown_seconds: 60,
-	log_level: "info",
+	enabled          : true,
+	target_percent   : 50,
+	cooldown_seconds : 60,
+	log_level        : "info",
 };
 
 // ─── Interfaces ────────────────────────────────────────────────────────────
@@ -121,23 +121,21 @@ function timestamp() : string
 // Load config from ~/.config/opencode/auto-compact.jsonc, fall back to defaults
 function loadConfig() : Config
 {
-	let file : Record<string, unknown> = {} ;
+	let file : Partial<Config> = {} ;
+	let loaded = false ;
 	try
 	{
-		file = Bun.JSONC.parse( readFileSync( CONFIG_FILE, "utf-8" ) ) ;
+		file = Bun.JSONC.parse( readFileSync( CONFIG_FILE, "utf8" ) ) as Partial<Config> ;
+		loaded = true ;
 	}
 	catch
 	{
 		log( LOG_LEVEL.ERROR, `Config not found or parse error at ${ CONFIG_FILE }` ) ;
 	}
 
-	// Validate between file values and defaults values.
-	CONFIG.enabled          = file.enabled          ?? CONFIG.enabled ;
-	CONFIG.target_percent   = file.target_percent   ?? CONFIG.target_percent ;
-	CONFIG.cooldown_seconds = file.cooldown_seconds ?? CONFIG.cooldown_seconds ;
-	CONFIG.log_level        = file.log_level        ?? CONFIG.log_level ;
+	Object.assign( CONFIG, file ) ;
 
-	log( LOG_LEVEL.INFO, "Config loaded" ) ;
+	log( LOG_LEVEL.INFO, loaded ? "Config loaded" : "Config loaded (defaults)" ) ;
 
 	return CONFIG ;
 }
