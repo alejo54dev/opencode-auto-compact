@@ -1,10 +1,11 @@
 /**
 *	auto-compact.ts
 *
-*	OpenCode plugin — fixed-percentage compaction trigger with model delegation.
-*	Fires native compaction at target_percent of the context window and lets
-*	opencode summarize with small_model (or an explicit provider/model), never
-*	with the working model.
+*	OpenCode plugin — fixed-percentage compaction trigger.
+*	Fires opencode's native compaction at target_percent of the context
+*	window. The summarizer model is opencode's own decision, configured via
+*	"agent.compaction.model" in opencode.jsonc (falls back to the session
+*	model when unset).
 *
 *	Install: cp auto-compact.ts ~/.config/opencode/plugins/auto-compact.ts
 *	Config:  ~/.config/opencode/auto-compact.jsonc
@@ -15,12 +16,11 @@
 *		"enabled": true,                // master switch
 *		"target_percent": 50,           // compact when context usage reaches this %
 *		"cooldown_seconds": 60,         // min seconds between compactions per session
-*		"compact_model": "small_model", // "small_model" | "provider/model" | ""
 *		"log_level": "info"             // "silent" | "error" | "info" | "debug"
 *	}
 *
 *	@name auto-compact
-*	@version 0.1.2
+*	@version 0.1.3
 *	@author Alejandro Carraretto
 *	@assistant DeepSeek-Flash
 *	@license AGPL-3.0
@@ -52,7 +52,6 @@ const CONFIG : Config =
 	enabled: true,
 	target_percent: 50,
 	cooldown_seconds: 60,
-	compact_model: "small_model",
 	log_level: "info",
 };
 
@@ -63,7 +62,6 @@ interface Config
 	enabled          : boolean ;
 	target_percent   : number ;
 	cooldown_seconds : number ;
-	compact_model    : string ;
 	log_level        : "silent" | "error" | "info" | "debug" ;
 }
 
@@ -137,7 +135,6 @@ function loadConfig() : Config
 	CONFIG.enabled          = file.enabled          ?? CONFIG.enabled ;
 	CONFIG.target_percent   = file.target_percent   ?? CONFIG.target_percent ;
 	CONFIG.cooldown_seconds = file.cooldown_seconds ?? CONFIG.cooldown_seconds ;
-	CONFIG.compact_model    = file.compact_model    ?? CONFIG.compact_model ;
 	CONFIG.log_level        = file.log_level        ?? CONFIG.log_level ;
 
 	log( LOG_LEVEL.INFO, "Config loaded" ) ;
@@ -171,7 +168,6 @@ class AutoCompact
 	private sessions : Map<string, SessionState> = new Map() ;
 	private loggedSummaries : Set<string> = new Set() ;
 	private providers : ProviderEntry[] | null = null ;
-	private smallModel : ModelRef | null | undefined = undefined ;
 
 	// Initialize: store config + client, no side effects
 	constructor( config : Config, client : PluginInput[ "client" ] )
@@ -213,15 +209,6 @@ class AutoCompact
 		return { context : model.limit?.context ?? 0 } ;
 	}
 
-	// Parse "provider/model" on the first slash
-	protected parseModel( value : string ) : ModelRef | null
-	{
-		const index = value.indexOf( "/" ) ;
-		if ( index <= 0 || index >= value.length - 1 ) return null ;
-
-		return { providerID : value.slice( 0, index ), modelID : value.slice( index + 1 ) } ;
-	}
-
 	// Sum every token counter reported by the provider for one assistant message
 	protected totalTokens( info : MessageInfo ) : number
 	{
@@ -232,47 +219,7 @@ class AutoCompact
 			+ ( t.cache?.read ?? 0 ) + ( t.cache?.write ?? 0 ) ;
 	}
 
-	// Pick the summarizer model: compact_model -> opencode small_model -> session model
-	protected async resolveModel( session : ModelRef ) : Promise<ModelRef>
-	{
-		const sessionRef = { providerID : session.providerID, modelID : session.modelID } ;
-		const configured = this.config.compact_model.trim() ;
-
-		if ( configured === "" ) return sessionRef ;
-
-		if ( configured !== "small_model" )
-		{
-			const parsed = this.parseModel( configured ) ;
-
-			if ( parsed && await this.findModel( parsed ) ) return parsed ;
-
-			log( LOG_LEVEL.ERROR, `compact_model unusable: ${ configured }` ) ;
-
-			return sessionRef ;
-		}
-
-		if ( this.smallModel === undefined )
-		{
-			this.smallModel = null ;
-
-			try
-			{
-				const res     = await this.client.config.get() ;
-				const value   = res?.data?.small_model ?? "" ;
-				const parsed  = value ? this.parseModel( value ) : null ;
-
-				if ( parsed && await this.findModel( parsed ) ) this.smallModel = parsed ;
-			}
-			catch ( err )
-			{
-				log( LOG_LEVEL.ERROR, `config.get failed: ${ ( err as Error ).message }` ) ;
-			}
-		}
-
-		return this.smallModel ?? sessionRef ;
-	}
-
-	// Force native compaction (summarize) on demand, with the resolved model.
+	// Force native compaction (summarize) on demand.
 	// The caller must have claimed state.inProgress; it is always released here.
 	protected async compact( sessionID : string, state : SessionState, percent : number ) : Promise<void>
 	{
@@ -287,8 +234,6 @@ class AutoCompact
 
 		try
 		{
-			const model = await this.resolveModel( usage ) ;
-
 			try
 			{
 				// ignored: UI-only notice, NOT sent to model
@@ -299,7 +244,7 @@ class AutoCompact
 						parts : [
 							{
 								type : "text" ,
-								text : `▣ auto-compact: ${ percent.toFixed( 1 ) }% ≥ ${ this.config.target_percent }% — compacting with ${ model.providerID }/${ model.modelID }` ,
+								text : `▣ auto-compact: ${ percent.toFixed( 1 ) }% ≥ ${ this.config.target_percent }% — compacting` ,
 								ignored : true ,
 							} ,
 						] ,
@@ -311,9 +256,11 @@ class AutoCompact
 				log( LOG_LEVEL.ERROR, `notice failed: ${ ( err as Error ).message }` ) ;
 			}
 
+			// The body model is only a fallback: opencode resolves the real
+			// summarizer from its own "compaction" agent configuration.
 			const res = await this.client.session.summarize( {
 				path : { id : sessionID } ,
-				body : { providerID : model.providerID, modelID : model.modelID } ,
+				body : { providerID : usage.providerID, modelID : usage.modelID } ,
 			} ) ;
 
 			if ( res?.error )
@@ -323,7 +270,7 @@ class AutoCompact
 			}
 
 			log( LOG_LEVEL.INFO,
-				`Compaction triggered | session: ${ sessionID } | model: ${ model.providerID }/${ model.modelID } | tokens: ${ usage.tokens }` ) ;
+				`Compaction triggered | session: ${ sessionID } | tokens: ${ usage.tokens }` ) ;
 		}
 		catch ( err )
 		{
