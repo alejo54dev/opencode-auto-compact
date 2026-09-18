@@ -14,13 +14,13 @@
 *	@example ~/.config/opencode/auto-compact.jsonc
 *	{
 *		"enabled": true,                // master switch
-*		"target_percent": 50,           // compact when context usage reaches this %
+*		"target_percent": 30,           // compact when context usage reaches this %
 *		"cooldown_seconds": 60,         // min seconds between compactions per session
 *		"log_level": "info"             // "silent" | "error" | "info" | "debug"
 *	}
 *
 *	@name auto-compact
-*	@version 0.1.5
+*	@version 0.1.6
 *	@author Alejandro Carraretto
 *	@assistant DeepSeek-Flash
 *	@license AGPL-3.0
@@ -50,7 +50,7 @@ const LOG_LEVEL =
 const CONFIG : Config =
 {
 	enabled          : true,
-	target_percent   : 50,
+	target_percent   : 30,
 	cooldown_seconds : 60,
 	log_level        : "info",
 };
@@ -123,6 +123,7 @@ function loadConfig() : Config
 {
 	let file : Partial<Config> = {} ;
 	let loaded = false ;
+
 	try
 	{
 		file = Bun.JSONC.parse( readFileSync( CONFIG_FILE, "utf8" ) ) as Partial<Config> ;
