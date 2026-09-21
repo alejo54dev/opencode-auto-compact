@@ -1,6 +1,6 @@
 # Auto Compact (your window, your rules)
 
-![Version](https://img.shields.io/badge/version-0.1.6-blue)
+![Version](https://img.shields.io/badge/version-0.1.7-blue)
 ![License](https://img.shields.io/badge/license-AGPL%203.0-blue)
 ![OpenCode v1](https://img.shields.io/badge/OpenCode-v1-purple)
 
@@ -83,7 +83,6 @@ Copy `auto-compact.jsonc` (included in this repo) to `~/.config/opencode/` and e
 {
 	"enabled": true,                // master switch
 	"target_percent": 30,           // compact when context usage reaches this %
-	"cooldown_seconds": 60,         // min seconds between compactions per session
 	"log_level": "info"             // "silent" | "error" | "info" | "debug"
 }
 ```
@@ -92,7 +91,6 @@ Copy `auto-compact.jsonc` (included in this repo) to `~/.config/opencode/` and e
 |---|---|---|
 | `enabled` | `true` | Master switch |
 | `target_percent` | `30` | Compact when `tokens / limit.context` reaches this % |
-| `cooldown_seconds` | `60` | Minimum seconds between compactions per session |
 | `log_level` | `"info"` | `"silent"`, `"error"`, `"info"`, `"debug"` |
 
 ### Model resolution
@@ -143,7 +141,7 @@ tail -f ~/.config/opencode/auto-compact.log
 ## 💬 Notes
 
 - **Single-claim guard** — `inProgress` is claimed synchronously in `evaluate()` (re-checked after every await) and released only in `compact()`'s `finally`. No event may release it, so concurrent idle events can never double-fire.
-- **Cooldown** — `cooldown_seconds` counts from the moment compaction starts; a session never compacts twice within the window.
+- **Cooldown** — a fixed 5-minute gap (`COOLDOWN_MS`, not user-configurable) counts from the moment compaction **finishes**. It bounds re-compaction to ≤12/hour/session even when a lazy summarize leaves the context above target, and a slow summarize never consumes the window.
 - **Notice is UI-only** — sent as an `ignored` text part with `noReply`; it never reaches the model and never counts as a turn.
 - **`tail_turns` stays native** — the plugin only triggers `session.summarize`; the verbatim tail and the real summarizer model live in `opencode.jsonc`.
 - **Known tradeoff** — a `summarize` that never settles (no resolve/reject) holds the claim until process restart. Accepted versus a time-based release, which reopens the double-compaction window.
@@ -159,4 +157,4 @@ Less is more. :)
 
 ## 📄 License
 
-AGPL-3.0 — version 0.1.6
+AGPL-3.0 — version 0.1.7

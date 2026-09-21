@@ -1,6 +1,5 @@
 {
 	"enabled": true,                // master switch
 	"target_percent": 30,           // compact when context usage reaches this %
-	"cooldown_seconds": 60,         // min seconds between compactions per session
 	"log_level": "info"             // "silent" | "error" | "info" | "debug"
 }

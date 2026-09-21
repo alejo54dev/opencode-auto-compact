@@ -15,12 +15,11 @@
 *	{
 *		"enabled": true,                // master switch
 *		"target_percent": 30,           // compact when context usage reaches this %
-*		"cooldown_seconds": 60,         // min seconds between compactions per session
 *		"log_level": "info"             // "silent" | "error" | "info" | "debug"
 *	}
 *
 *	@name auto-compact
-*	@version 0.1.6
+*	@version 0.1.7
 *	@author Alejandro Carraretto
 *	@assistant DeepSeek-Flash
 *	@license AGPL-3.0
@@ -49,20 +48,21 @@ const LOG_LEVEL =
 
 const CONFIG : Config =
 {
-	enabled          : true,
-	target_percent   : 30,
-	cooldown_seconds : 60,
-	log_level        : "info",
+	enabled        : true,
+	target_percent : 30,
+	log_level      : "info",
 };
+
+// Compaction guard — frozen value, not a user knob
+const COOLDOWN_MS = 300_000 ;   // min gap after a compaction finishes (loop-breaker for lazy models)
 
 // ─── Interfaces ────────────────────────────────────────────────────────────
 
 interface Config
 {
-	enabled          : boolean ;
-	target_percent   : number ;
-	cooldown_seconds : number ;
-	log_level        : "silent" | "error" | "info" | "debug" ;
+	enabled        : boolean ;
+	target_percent : number ;
+	log_level      : "silent" | "error" | "info" | "debug" ;
 }
 
 interface ModelRef
@@ -229,8 +229,6 @@ class AutoCompact
 			return ;
 		}
 
-		state.lastCompactAt = Date.now() ;
-
 		try
 		{
 			try
@@ -277,6 +275,9 @@ class AutoCompact
 		}
 		finally
 		{
+			// Cooldown starts when compaction finishes, not when it starts: a slow
+			// summarize must not consume the whole window before it is set.
+			state.lastCompactAt = Date.now() ;
 			state.inProgress = false ;
 		}
 	}
@@ -291,7 +292,7 @@ class AutoCompact
 
 		if ( state.inProgress ) return ;
 
-		if ( Date.now() - state.lastCompactAt < this.config.cooldown_seconds * 1000 ) return ;
+		if ( Date.now() - state.lastCompactAt < COOLDOWN_MS ) return ;
 
 		const model = await this.findModel( state.usage ) ;
 		if ( ! model?.context ) return ;
