@@ -14,7 +14,7 @@
 *	@example ~/.config/opencode/auto-compact.jsonc
 *	{
 *		"enabled": true,                // master switch
-*		"target_percent": 30,           // compact when context usage reaches this %
+*		"target_percent": 25,           // compact when context usage reaches this %
 *		"log_level": "info"             // "silent" | "error" | "info" | "debug"
 *	}
 *
@@ -49,7 +49,7 @@ const LOG_LEVEL =
 const CONFIG : Config =
 {
 	enabled        : true,
-	target_percent : 30,
+	target_percent : 25,
 	log_level      : "info",
 };
 

@@ -10,13 +10,13 @@
 
 > Compaction on your terms: your %, their tokens.
 
-- **Fixed percentage trigger** — compacts when context usage reaches `target_percent` (e.g. 30%), regardless of opencode's internal formula.
+- **Fixed percentage trigger** — compacts when context usage reaches `target_percent` (e.g. 25%), regardless of opencode's internal formula.
 
 - **OpenCode decides the model** — summarization runs on the native `compaction` agent, so the model configured in `agent.compaction.model` (e.g. a cheap one) pays the summary bill; when unset, the session model is the fallback.
 
 - **Native engine, custom trigger** — fires opencode's internal `session.summarize` (the same one behind `/compact`), so the summary, verbatim tail and recovery stay 100% opencode.
 
-- **Terminal notice** — one ignored line per trigger (`▣ auto-compact: 31.2% ≥ 30% — compacting`). UI-only: never sent to the model (`ignored` part + `noReply` prompt).
+- **Terminal notice** — one ignored line per trigger (`▣ auto-compact: 25.4% ≥ 25% — compacting`). UI-only: never sent to the model (`ignored` part + `noReply` prompt).
 
 - **Safe by design** — single-claim `inProgress` guard (synchronous claim, `finally` release), per-session cooldown, errors logged without breaking the session.
 
@@ -60,7 +60,7 @@ flowchart TD
 
 **The daily driver pays less.** Every compaction pays summary tokens with the model configured on the native `compaction` agent. Point it at a cheap model and the bill drops to pocket change.
 
-**No surprise compactions.** Native auto decides *when*. Here 30% means 30%, every session, every project — visible in the config, not in the engine's mood.
+**No surprise compactions.** Native auto decides *when*. Here 25% means 25%, every session, every project — visible in the config, not in the engine's mood.
 
 **Long unattended runs.** A build-and-fix loop at 2 AM fills the window. The plugin fires at the threshold and the session keeps moving — no manual `/compact` at 3 AM.
 
@@ -82,7 +82,7 @@ Copy `auto-compact.jsonc` (included in this repo) to `~/.config/opencode/` and e
 ```jsonc
 {
 	"enabled": true,                // master switch
-	"target_percent": 30,           // compact when context usage reaches this %
+	"target_percent": 25,           // compact when context usage reaches this %
 	"log_level": "info"             // "silent" | "error" | "info" | "debug"
 }
 ```
@@ -90,7 +90,7 @@ Copy `auto-compact.jsonc` (included in this repo) to `~/.config/opencode/` and e
 | Field | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Master switch |
-| `target_percent` | `30` | Compact when `tokens / limit.context` reaches this % |
+| `target_percent` | `25` | Compact when `tokens / limit.context` reaches this % |
 | `log_level` | `"info"` | `"silent"`, `"error"`, `"info"`, `"debug"` |
 
 ### Model resolution
@@ -132,7 +132,7 @@ tail -f ~/.config/opencode/auto-compact.log
 ```log
 [2026-09-16T21:08:32] [INFO]: Config loaded
 [2026-09-16T21:08:32] [INFO]: Initialized
-[2026-09-16T21:17:23] [INFO]: Threshold reached | session: ses_f5346621affe2bfWHSUKv6WeVB | 51.3% >= 50%
+[2026-09-16T21:17:23] [INFO]: Threshold reached | session: ses_f5346621affe2bfWHSUKv6WeVB | 25.4% >= 25%
 [2026-09-16T21:17:23] [INFO]: Summary generated | model: poolside/poolside/laguna-s-2.1
 [2026-09-16T21:17:23] [INFO]: Compaction triggered | session: ses_f5346621affe2bfWHSUKv6WeVB | tokens: 7339
 [2026-09-16T21:18:10] [INFO]: Disposed
