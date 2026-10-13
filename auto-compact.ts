@@ -19,10 +19,11 @@
 *	}
 *
 *	@name auto-compact
-*	@version 0.1.7
+*	@version 0.1.8
 *	@author Alejandro Carraretto
 *	@assistant DeepSeek-Flash
 *	@license AGPL-3.0
+*	@compatibility OpenCode v1
 */
 
 import type { Plugin, PluginInput } from "@opencode-ai/plugin" ;
@@ -200,7 +201,7 @@ class AutoCompact
 	protected async findModel( ref : ModelRef ) : Promise<{ context : number } | null>
 	{
 		const providers = await this.providerList() ;
-		const provider  = providers?.find( p => p.id === ref.providerID ) ;
+		const provider  = providers?.find( p => p.id == ref.providerID ) ;
 		const model     = provider?.models?.[ ref.modelID ] ;
 
 		if ( ! model ) return null ;
@@ -314,7 +315,7 @@ class AutoCompact
 	// Cache usage from assistant messages; log the summarizer model on summary messages
 	protected onMessage( info : MessageInfo | undefined ) : void
 	{
-		if ( ! info || info.role !== "assistant" ) return ;
+		if ( ! info || info.role != "assistant" ) return ;
 
 		if ( info.summary )
 		{
@@ -350,13 +351,13 @@ class AutoCompact
 	{
 		try
 		{
-			if ( event.type === "message.updated" )
+			if ( event.type == "message.updated" )
 			{
 				this.onMessage( event.properties?.info ) ;
 				return ;
 			}
 
-			if ( event.type === "session.idle" )
+			if ( event.type == "session.idle" )
 			{
 				await this.evaluate( event.properties?.sessionID ) ;
 			}
